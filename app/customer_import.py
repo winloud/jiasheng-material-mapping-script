@@ -7,23 +7,52 @@ from typing import Any, List, Dict, Tuple
 # ============================================================
 # 配置区 —— 日常使用主要修改这里
 # 高速版：一个 Excel 只打开一次，并使用流式行读取。
+# 当前规则：D列为空结束；B列为空时仍提取，并按D列与已有数据去重。
+# 目录规则：仅扫描“待处理”；数据、备份和日志均按项目目录分类存放。
+# 安全规则：写入已有汇总表前自动备份；可配置按D匹配无料号历史行并只回填B列。
 # ============================================================
 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DATA_DIR = PROJECT_ROOT / "data"
+MASTER_FILE = DATA_DIR / "嘉盛物料映射汇总表.xlsx"
+CUSTOMER_DIR = DATA_DIR / "客户清单"
+CUSTOMER_PENDING = CUSTOMER_DIR / "待处理"
+CUSTOMER_DONE = CUSTOMER_DIR / "已处理"
+CUSTOMER_ERROR = CUSTOMER_DIR / "异常"
+BACKUP_DIR = PROJECT_ROOT / "backup"
+LOG_DIR = PROJECT_ROOT / "logs"
+
 CONFIG = {
-    # 当前脚本所在目录
-    "input_dir": Path(__file__).resolve().parent,
+    # 工作目录：当前脚本所在目录
+    "work_dir": PROJECT_ROOT,
+
+    # 输入目录：只处理“待处理”文件夹中的 Excel
+    "input_dir": CUSTOMER_PENDING,
 
     # 输出文件名
-    "output_file": "03-嘉盛物料映射汇总表.xlsx",
+    "output_file": MASTER_FILE,
 
     # 异常文件移动目录（读取失败的文件会移动到这里）
-    "error_dir": "异常表",
+    "error_dir": CUSTOMER_ERROR,
 
     # 正常完成文件移动目录（处理成功的文件会移动到这里）
-    "done_dir": "已读取",
+    "done_dir": CUSTOMER_DONE,
 
     # 日志文件名
-    "log_file": "02-处理日志.log",
+    "log_file": LOG_DIR / "customer_import.log",
+
+    # 每次修改已有汇总表前，是否自动备份
+    "backup_before_write": True,
+
+    # 备份目录（位于脚本同级目录）
+    "backup_dir": BACKUP_DIR,
+
+    # 当新数据 B 列已有物料号、但该物料号在汇总表中不存在时：
+    # 是否继续按 D 列查找“B列为空”的历史记录。
+    # True：若 D 唯一匹配，则只回填历史行的 B 列，不追加新行，
+    #       M~V 等人工维护的映射列完全不改。
+    # False：保持旧逻辑，B物料号不存在时直接按新行追加。
+    "backfill_material_no_by_d": True,
 
     # 并行读取文件数（1 为串行，建议 4~8）
     "max_workers": 8,
@@ -31,10 +60,16 @@ CONFIG = {
     # 是否在最终结果后面增加来源信息
     "add_source_info": True,
 
-    # 去重依据：
+    # 主去重依据：
     # 最终统一结构中的第几列，从 1 开始
-    # 当前第 1 列是序号，第 2 列是物料编码
+    # 当前第 2 列为物料号；物料号存在时优先按此列去重
     "dedup_col": 2,
+
+    # 备用去重依据：
+    # 当主去重列（B列物料号）为空时，改按最终统一结构的 D 列去重
+    # 同时会把已有数据中所有非空 D 值建立索引，
+    # 因此“新物料无物料号”时，可判断 D 是否已在历史数据中出现
+    "fallback_dedup_col": 4,
 
     # 数量所在的目标列（最终结构中的第几列，从 1 开始）
     # G 列 = 第 7 列
@@ -61,7 +96,7 @@ CONFIG = {
             "end_col": "F",
 
             # 以哪一列为空作为数据结束
-            "stop_col": "A",
+            "stop_col": "D",
 
             # 字段映射：
             # 最终统一结构一共 7 列
@@ -91,7 +126,7 @@ CONFIG = {
             "start_row": 3,
             "start_col": "A",
             "end_col": "G",
-            "stop_col": "A",
+            "stop_col": "D",
 
             # A:G 原样映射到最终 7 列
             "column_mapping": [
@@ -478,18 +513,39 @@ def build_header() -> List[str]:
     return header
 
 
-def read_existing_output(output_path: Path) -> Tuple[set, int]:
+def read_existing_output(
+    output_path: Path,
+) -> Tuple[set, set, Dict[str, List[int]], int]:
     """
-    读取已有输出文件中的物料号集合和最大序号，
-    用于追加模式去重和序号续接。
+    读取已有汇总表，建立去重与回填索引。
+
+    返回：
+    - existing_primary_keys：已有非空 B 列物料号集合
+    - existing_fallback_keys：已有所有非空 D 列值集合
+    - blank_primary_rows_by_d：B 为空的历史行，按 D 建立 {D: [Excel行号...]} 索引
+    - max_seq：最大序号
+
+    规则：
+    1. 新数据 B 有物料号时，优先按 B 去重；
+    2. 新数据 B 为空时，按 D 去重；
+    3. 开启 backfill_material_no_by_d 后：
+       B 有物料号但按 B 找不到时，可按 D 查找历史“B为空”记录，
+       唯一匹配时仅补写该历史行的 B 列。
     """
     from openpyxl import load_workbook
 
-    existing_keys = set()
+    existing_primary_keys = set()
+    existing_fallback_keys = set()
+    blank_primary_rows_by_d: Dict[str, List[int]] = {}
     max_seq = 0
 
     if not output_path.exists():
-        return existing_keys, max_seq
+        return (
+            existing_primary_keys,
+            existing_fallback_keys,
+            blank_primary_rows_by_d,
+            max_seq,
+        )
 
     try:
         wb = load_workbook(
@@ -499,28 +555,56 @@ def read_existing_output(output_path: Path) -> Tuple[set, int]:
         )
         ws = wb.active
 
-        for row in ws.iter_rows(
-            min_row=2,
-            values_only=True,
+        primary_index = CONFIG["dedup_col"] - 1
+        fallback_index = CONFIG["fallback_dedup_col"] - 1
+
+        for excel_row_no, row in enumerate(
+            ws.iter_rows(
+                min_row=2,
+                values_only=True,
+            ),
+            start=2,
         ):
-            if row and len(row) > 1:
-                if row[0] is not None:
-                    try:
-                        seq = int(row[0])
-                        if seq > max_seq:
-                            max_seq = seq
-                    except (ValueError, TypeError):
-                        pass
-                if row[1] is not None:
-                    key = normalize_key(row[1])
-                    if key:
-                        existing_keys.add(key)
+            if not row:
+                continue
+
+            if row[0] is not None:
+                try:
+                    seq = int(row[0])
+                    if seq > max_seq:
+                        max_seq = seq
+                except (ValueError, TypeError):
+                    pass
+
+            primary_key = ""
+            if primary_index < len(row):
+                primary_key = normalize_key(row[primary_index])
+                if primary_key:
+                    existing_primary_keys.add(primary_key)
+
+            fallback_key = ""
+            if fallback_index < len(row):
+                fallback_key = normalize_key(row[fallback_index])
+                if fallback_key:
+                    existing_fallback_keys.add(fallback_key)
+
+            # 只记录“B为空 + D非空”的历史行，供后续安全回填 B。
+            if not primary_key and fallback_key:
+                blank_primary_rows_by_d.setdefault(
+                    fallback_key,
+                    [],
+                ).append(excel_row_no)
 
         wb.close()
     except Exception:
         pass
 
-    return existing_keys, max_seq
+    return (
+        existing_primary_keys,
+        existing_fallback_keys,
+        blank_primary_rows_by_d,
+        max_seq,
+    )
 
 
 def write_output(
@@ -547,21 +631,76 @@ def write_output(
     wb.save(output_path)
 
 
+def backup_existing_output(
+    output_path: Path,
+    backup_dir: Path,
+) -> Path | None:
+    """
+    修改已有汇总表前创建完整备份。
+    若汇总表尚不存在，则无需备份。
+    """
+    if not output_path.exists():
+        return None
+
+    backup_dir.mkdir(parents=True, exist_ok=True)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_path = (
+        backup_dir
+        / f"{output_path.stem}_{timestamp}{output_path.suffix}"
+    )
+
+    # 极少数情况下同一秒运行多次，避免覆盖前一份备份。
+    index = 1
+    while backup_path.exists():
+        backup_path = (
+            backup_dir
+            / f"{output_path.stem}_{timestamp}_{index}"
+            f"{output_path.suffix}"
+        )
+        index += 1
+
+    shutil.copy2(output_path, backup_path)
+    return backup_path
+
+
 def append_output(
     output_path: Path,
     rows: List[List[Any]],
     header: List[str],
+    backfill_updates: Dict[int, Any] | None = None,
 ):
+    """
+    将本次变化一次性保存到汇总表。
 
+    backfill_updates:
+        {Excel行号: 新物料号}
+
+    回填时只修改 CONFIG["dedup_col"] 对应的 B 列，
+    其它所有列（尤其 M~V 人工映射关系）保持原值。
+    """
     from openpyxl import load_workbook
 
+    backfill_updates = backfill_updates or {}
+
     if not output_path.exists():
+        # 新建文件时不存在历史行，因此正常情况下不会有回填任务。
         write_output(output_path, rows, header)
         return
 
     wb = load_workbook(output_path)
     ws = wb.active
 
+    primary_col = CONFIG["dedup_col"]
+
+    # 先只回填 B 物料号，不触碰其它任何列。
+    for excel_row_no, material_no in backfill_updates.items():
+        ws.cell(
+            row=excel_row_no,
+            column=primary_col,
+        ).value = material_no
+
+    # 再追加真正的新行。
     for row in rows:
         padded = list(row) + [None] * (
             len(header) - len(row)
@@ -680,18 +819,19 @@ def process_one_file(
 
 def main():
 
-    input_dir = CONFIG["input_dir"]
+    work_dir = CONFIG["work_dir"]
+    input_dir = Path(CONFIG["input_dir"])
+    output_path = Path(CONFIG["output_file"])
+    error_dir = Path(CONFIG["error_dir"])
+    done_dir = Path(CONFIG["done_dir"])
+    log_path = Path(CONFIG["log_file"])
 
-    output_path = (
-        input_dir
-        / CONFIG["output_file"]
-    )
-
-    error_dir = input_dir / CONFIG["error_dir"]
-
-    done_dir = input_dir / CONFIG["done_dir"]
-
-    log_path = input_dir / CONFIG["log_file"]
+    # 自动创建运行目录
+    input_dir.mkdir(parents=True, exist_ok=True)
+    error_dir.mkdir(parents=True, exist_ok=True)
+    done_dir.mkdir(parents=True, exist_ok=True)
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
 
     batch_time = datetime.now().strftime(
         "%Y-%m-%d %H:%M:%S"
@@ -743,13 +883,22 @@ def main():
     # 读取已有输出（追加模式）
     # --------------------------------------------------------
 
-    seen_keys, next_seq = read_existing_output(
-        output_path
-    )
+    (
+        seen_primary_keys,
+        seen_fallback_keys,
+        blank_primary_rows_by_d,
+        next_seq,
+    ) = read_existing_output(output_path)
 
-    if seen_keys:
+    if seen_primary_keys or seen_fallback_keys:
+        blank_primary_row_count = sum(
+            len(v)
+            for v in blank_primary_rows_by_d.values()
+        )
         log(
-            f"已有物料记录：{len(seen_keys)} 条，"
+            f"已有物料号索引：{len(seen_primary_keys)} 条，"
+            f"D列索引：{len(seen_fallback_keys)} 条，"
+            f"待补物料号历史行：{blank_primary_row_count} 条，"
             f"最大序号：{next_seq}\n"
         )
 
@@ -764,8 +913,14 @@ def main():
 
     raw_count = 0
     duplicate_count = 0
+    backfill_count = 0
+    backfill_ambiguous_count = 0
 
     result_rows = []
+
+    # {已有汇总表Excel行号: 新物料号}
+    # 保存时只修改这些历史行的 B 列。
+    backfill_updates: Dict[int, Any] = {}
 
     # --------------------------------------------------------
     # 并行扫描文件
@@ -845,22 +1000,103 @@ def main():
 
                     raw_count += 1
 
-                    dedup_index = (
+                    primary_index = (
                         CONFIG["dedup_col"] - 1
                     )
-
-                    key = normalize_key(
-                        row[dedup_index]
+                    fallback_index = (
+                        CONFIG["fallback_dedup_col"] - 1
                     )
 
-                    if not key:
-                        continue
+                    primary_key = normalize_key(
+                        row[primary_index]
+                    )
+                    fallback_key = normalize_key(
+                        row[fallback_index]
+                    )
 
-                    if key in seen_keys:
-                        duplicate_count += 1
-                        continue
+                    # ------------------------------------------------
+                    # B列有物料号：
+                    # 1) 先按 B 去重；
+                    # 2) 若 B 未出现，且开启回填开关，则按 D 查找
+                    #    历史“B为空”的记录；
+                    # 3) D 唯一匹配 -> 只回填旧行 B，不追加新行；
+                    # 4) 两边都找不到 -> 才追加新行。
+                    # ------------------------------------------------
+                    if primary_key:
+                        if primary_key in seen_primary_keys:
+                            duplicate_count += 1
+                            continue
 
-                    seen_keys.add(key)
+                        did_backfill = False
+
+                        if (
+                            CONFIG["backfill_material_no_by_d"]
+                            and fallback_key
+                        ):
+                            matched_rows = blank_primary_rows_by_d.get(
+                                fallback_key,
+                                [],
+                            )
+
+                            if len(matched_rows) == 1:
+                                excel_row_no = matched_rows[0]
+
+                                backfill_updates[excel_row_no] = row[
+                                    primary_index
+                                ]
+                                backfill_count += 1
+                                did_backfill = True
+
+                                # 本次运行后该 B 已视为存在，避免后续重复处理。
+                                seen_primary_keys.add(primary_key)
+
+                                # 该 D 对应的空B历史行已被占用，
+                                # 防止同一次运行中被第二个不同物料号再次回填。
+                                blank_primary_rows_by_d.pop(
+                                    fallback_key,
+                                    None,
+                                )
+
+                                log(
+                                    f"    [回填物料号] D={fallback_key} "
+                                    f"-> 汇总表第{excel_row_no}行 B="
+                                    f"{primary_key}"
+                                )
+
+                            elif len(matched_rows) > 1:
+                                # D 对应多个空B历史行时，不自动猜测。
+                                # 为避免错误覆盖人工映射，保留历史行不动，
+                                # 当前有物料号的数据按新行追加。
+                                backfill_ambiguous_count += 1
+                                log(
+                                    f"    [警告] D={fallback_key} "
+                                    f"匹配到 {len(matched_rows)} 条"
+                                    f"B为空的历史记录，未自动回填；"
+                                    f"本条按新行追加。"
+                                )
+
+                        if did_backfill:
+                            continue
+
+                        # B 和可回填的 D 都没找到：新增一行。
+                        seen_primary_keys.add(primary_key)
+
+                        if fallback_key:
+                            seen_fallback_keys.add(fallback_key)
+
+                    # ------------------------------------------------
+                    # B列为空：
+                    # 仍提取，但按 D 与已有/本次数据去重。
+                    # ------------------------------------------------
+                    else:
+                        if not fallback_key:
+                            continue
+
+                        if fallback_key in seen_fallback_keys:
+                            duplicate_count += 1
+                            continue
+
+                        seen_fallback_keys.add(fallback_key)
 
                     output_row = list(row)
 
@@ -916,13 +1152,32 @@ def main():
 
     header = build_header()
 
-    if result_rows:
+    has_output_changes = bool(
+        result_rows or backfill_updates
+    )
+
+    if has_output_changes:
 
         try:
+            # 只有“已有汇总表即将被修改”时才创建备份。
+            if (
+                CONFIG["backup_before_write"]
+                and output_path.exists()
+            ):
+                backup_path = backup_existing_output(
+                    output_path,
+                    Path(CONFIG["backup_dir"]),
+                )
+                if backup_path is not None:
+                    log(
+                        f"[备份] 已创建：{backup_path}"
+                    )
+
             append_output(
                 output_path,
                 result_rows,
                 header,
+                backfill_updates=backfill_updates,
             )
         except PermissionError:
             log(
@@ -959,7 +1214,7 @@ def main():
     )
 
     log(
-        f"已移动已读取文件：{file_done_moved}"
+        f"已移动已处理文件：{file_done_moved}"
     )
 
     log(
@@ -968,6 +1223,14 @@ def main():
 
     log(
         f"重复物料条数：{duplicate_count}"
+    )
+
+    log(
+        f"本次回填物料号：{backfill_count} 条"
+    )
+
+    log(
+        f"D列多重匹配未自动回填：{backfill_ambiguous_count} 条"
     )
 
     log(
@@ -983,10 +1246,6 @@ def main():
     )
 
     save_log(log_path)
-
-    input(
-        "\n按回车键退出..."
-    )
 
 
 # ============================================================

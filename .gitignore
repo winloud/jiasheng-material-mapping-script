@@ -1,2 +1,6 @@
-已读取/
-异常表/
+data/客户清单
+data/映射合并
+data/请将主汇总表放到此目录.txt
+backup/
+logs/
+app/__pycache__
