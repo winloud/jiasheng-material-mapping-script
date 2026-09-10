@@ -50,7 +50,7 @@ CONFIG = {
     # 当新数据 B 列已有物料号、但该物料号在汇总表中不存在时：
     # 是否继续按 D 列查找“B列为空”的历史记录。
     # True：若 D 唯一匹配，则只回填历史行的 B 列，不追加新行，
-    #       M~V 等人工维护的映射列完全不改。
+    #       M~X 等人工维护的映射列完全不改。
     # False：保持旧逻辑，B物料号不存在时直接按新行追加。
     "backfill_material_no_by_d": True,
 
@@ -81,7 +81,7 @@ CONFIG = {
     "mapping_start_col": "M",
 
     # 最多放几种物料映射
-    "mapping_count": 5,
+    "mapping_count": 6,
 
     # 每个 Sheet 独立配置
     "sheets": [
@@ -677,7 +677,7 @@ def append_output(
         {Excel行号: 新物料号}
 
     回填时只修改 CONFIG["dedup_col"] 对应的 B 列，
-    其它所有列（尤其 M~V 人工映射关系）保持原值。
+    其它所有列（尤其 M~X 人工映射关系）保持原值。
     """
     from openpyxl import load_workbook
 
@@ -817,440 +817,177 @@ def process_one_file(
 # 主程序
 # ============================================================
 
-def main():
+def run_project(project_dir: Path) -> Dict[str, Any]:
+    """按项目目录执行脚本1。原始项目文件只读，不移动。"""
+    from project_utils import iter_project_excel_files, project_log_dir
 
-    work_dir = CONFIG["work_dir"]
-    input_dir = Path(CONFIG["input_dir"])
-    output_path = Path(CONFIG["output_file"])
-    error_dir = Path(CONFIG["error_dir"])
-    done_dir = Path(CONFIG["done_dir"])
-    log_path = Path(CONFIG["log_file"])
-
-    # 自动创建运行目录
-    input_dir.mkdir(parents=True, exist_ok=True)
-    error_dir.mkdir(parents=True, exist_ok=True)
-    done_dir.mkdir(parents=True, exist_ok=True)
+    _log_lines.clear()
+    project_dir = Path(project_dir).resolve()
+    output_path = MASTER_FILE
+    log_path = project_log_dir(project_dir) / "01_导入客户物料清单.log"
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
 
-    batch_time = datetime.now().strftime(
-        "%Y-%m-%d %H:%M:%S"
-    )
-
+    batch_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     log("=" * 60)
-    log("Excel 物料汇总工具")
+    log("脚本1：导入客户物料清单")
     log(f"处理时间：{batch_time}")
+    log(f"项目目录：{project_dir}")
+    log("原始项目文件只读，不移动。")
     log("=" * 60)
 
-    # --------------------------------------------------------
-    # 找 Excel
-    # --------------------------------------------------------
+    excel_files = iter_project_excel_files(project_dir)
+    log(f"\n发现候选 Excel 文件：{len(excel_files)} 个\n")
+    if not excel_files:
+        result = {
+            "success": False, "can_continue": False, "new_materials": 0,
+            "reason": "项目目录中没有找到可处理的电气清单 Excel 文件。",
+            "files": 0,
+        }
+        log(f"[错误] {result['reason']}")
+        save_log(log_path)
+        return result
 
-    excel_files = []
+    try:
+        seen_primary_keys, seen_fallback_keys, blank_primary_rows_by_d, next_seq = read_existing_output(output_path)
+    except Exception as exc:
+        result = {"success": False, "can_continue": False, "new_materials": 0, "reason": f"读取主映射表失败：{exc}"}
+        log(f"[错误] {result['reason']}")
+        save_log(log_path)
+        return result
 
-    for file_path in input_dir.iterdir():
-
-        if not file_path.is_file():
-            continue
-
-        if file_path.name.startswith("~$"):
-            continue
-
-        if file_path.name == CONFIG["output_file"]:
-            continue
-
-        if file_path.name == CONFIG["log_file"]:
-            continue
-
-        if file_path.suffix.lower() in (
-            ".xls",
-            ".xlsx",
-            ".xlsm",
-        ):
-            excel_files.append(file_path)
-
-    excel_files.sort()
-
-    log(
-        f"\n扫描目录：{input_dir}"
-    )
-
-    log(
-        f"发现 Excel 文件：{len(excel_files)} 个\n"
-    )
-
-    # --------------------------------------------------------
-    # 读取已有输出（追加模式）
-    # --------------------------------------------------------
-
-    (
-        seen_primary_keys,
-        seen_fallback_keys,
-        blank_primary_rows_by_d,
-        next_seq,
-    ) = read_existing_output(output_path)
-
-    if seen_primary_keys or seen_fallback_keys:
-        blank_primary_row_count = sum(
-            len(v)
-            for v in blank_primary_rows_by_d.values()
-        )
-        log(
-            f"已有物料号索引：{len(seen_primary_keys)} 条，"
-            f"D列索引：{len(seen_fallback_keys)} 条，"
-            f"待补物料号历史行：{blank_primary_row_count} 条，"
-            f"最大序号：{next_seq}\n"
-        )
-
-    # --------------------------------------------------------
-    # 统计
-    # --------------------------------------------------------
-
-    file_success = 0
-    file_failed = 0
-    file_moved = 0
-    file_done_moved = 0
-
-    raw_count = 0
-    duplicate_count = 0
-    backfill_count = 0
-    backfill_ambiguous_count = 0
-
+    file_success = file_failed = 0
+    raw_count = duplicate_count = backfill_count = backfill_ambiguous_count = 0
     result_rows = []
-
-    # {已有汇总表Excel行号: 新物料号}
-    # 保存时只修改这些历史行的 B 列。
     backfill_updates: Dict[int, Any] = {}
 
-    # --------------------------------------------------------
-    # 并行扫描文件
-    # --------------------------------------------------------
-
-    max_workers = CONFIG["max_workers"]
-
-    log(f"并行读取：{max_workers} 线程\n")
-
+    log(f"并行读取：{CONFIG['max_workers']} 线程\n")
     all_results: List[Tuple[Path, bool, List[Dict[str, Any]], str]] = []
-
-    with ThreadPoolExecutor(
-        max_workers=max_workers,
-    ) as executor:
-
-        future_map = {
-            executor.submit(
-                process_one_file, fp
-            ): fp
-            for fp in excel_files
-        }
-
+    with ThreadPoolExecutor(max_workers=CONFIG["max_workers"]) as executor:
+        future_map = {executor.submit(process_one_file, fp): fp for fp in excel_files}
         done_count = 0
-
         for future in as_completed(future_map):
-
             fp = future_map[future]
             done_count += 1
-
             try:
                 result = future.result()
             except Exception as exc:
                 result = (fp, False, [], str(exc))
-
             all_results.append(result)
-
-            file_path_r, file_ok_r, sheet_results_r, error_msg_r = result
-
-            log(
-                f"[{done_count}/{len(excel_files)}] "
-                f"{'OK' if file_ok_r else 'FAIL'} "
-                f"{file_path_r.name}"
-            )
-
-            if file_ok_r:
-                for sr in sheet_results_r:
-                    log(
-                        f"    {sr['sheet_name']}: "
-                        f"{len(sr['rows'])} 行"
-                    )
+            _, ok, sheets, err = result
+            log(f"[{done_count}/{len(excel_files)}] {'OK' if ok else 'FAIL'} {fp.relative_to(project_dir)}")
+            if ok:
+                for sr in sheets:
+                    log(f"    {sr['sheet_name']}: {len(sr['rows'])} 行")
             else:
-                log(f"    [错误] {error_msg_r}")
+                log(f"    [错误] {err}")
 
-    # --------------------------------------------------------
-    # 合并去重 + 移动文件（保持文件顺序）
-    # --------------------------------------------------------
-
-    file_order = {
-        file_path: index
-        for index, file_path in enumerate(excel_files)
-    }
-
-    all_results.sort(
-        key=lambda r: file_order[r[0]]
-    )
+    order = {fp: i for i, fp in enumerate(excel_files)}
+    all_results.sort(key=lambda r: order[r[0]])
 
     for file_path, file_ok, sheet_results, error_msg in all_results:
-
-        if file_ok:
-
-            for sr in sheet_results:
-
-                sheet_name = sr["sheet_name"]
-                rows = sr["rows"]
-
-                for row in rows:
-
-                    raw_count += 1
-
-                    primary_index = (
-                        CONFIG["dedup_col"] - 1
-                    )
-                    fallback_index = (
-                        CONFIG["fallback_dedup_col"] - 1
-                    )
-
-                    primary_key = normalize_key(
-                        row[primary_index]
-                    )
-                    fallback_key = normalize_key(
-                        row[fallback_index]
-                    )
-
-                    # ------------------------------------------------
-                    # B列有物料号：
-                    # 1) 先按 B 去重；
-                    # 2) 若 B 未出现，且开启回填开关，则按 D 查找
-                    #    历史“B为空”的记录；
-                    # 3) D 唯一匹配 -> 只回填旧行 B，不追加新行；
-                    # 4) 两边都找不到 -> 才追加新行。
-                    # ------------------------------------------------
-                    if primary_key:
-                        if primary_key in seen_primary_keys:
-                            duplicate_count += 1
-                            continue
-
-                        did_backfill = False
-
-                        if (
-                            CONFIG["backfill_material_no_by_d"]
-                            and fallback_key
-                        ):
-                            matched_rows = blank_primary_rows_by_d.get(
-                                fallback_key,
-                                [],
-                            )
-
-                            if len(matched_rows) == 1:
-                                excel_row_no = matched_rows[0]
-
-                                backfill_updates[excel_row_no] = row[
-                                    primary_index
-                                ]
-                                backfill_count += 1
-                                did_backfill = True
-
-                                # 本次运行后该 B 已视为存在，避免后续重复处理。
-                                seen_primary_keys.add(primary_key)
-
-                                # 该 D 对应的空B历史行已被占用，
-                                # 防止同一次运行中被第二个不同物料号再次回填。
-                                blank_primary_rows_by_d.pop(
-                                    fallback_key,
-                                    None,
-                                )
-
-                                log(
-                                    f"    [回填物料号] D={fallback_key} "
-                                    f"-> 汇总表第{excel_row_no}行 B="
-                                    f"{primary_key}"
-                                )
-
-                            elif len(matched_rows) > 1:
-                                # D 对应多个空B历史行时，不自动猜测。
-                                # 为避免错误覆盖人工映射，保留历史行不动，
-                                # 当前有物料号的数据按新行追加。
-                                backfill_ambiguous_count += 1
-                                log(
-                                    f"    [警告] D={fallback_key} "
-                                    f"匹配到 {len(matched_rows)} 条"
-                                    f"B为空的历史记录，未自动回填；"
-                                    f"本条按新行追加。"
-                                )
-
-                        if did_backfill:
-                            continue
-
-                        # B 和可回填的 D 都没找到：新增一行。
-                        seen_primary_keys.add(primary_key)
-
-                        if fallback_key:
-                            seen_fallback_keys.add(fallback_key)
-
-                    # ------------------------------------------------
-                    # B列为空：
-                    # 仍提取，但按 D 与已有/本次数据去重。
-                    # ------------------------------------------------
-                    else:
-                        if not fallback_key:
-                            continue
-
-                        if fallback_key in seen_fallback_keys:
-                            duplicate_count += 1
-                            continue
-
-                        seen_fallback_keys.add(fallback_key)
-
-                    output_row = list(row)
-
-                    if CONFIG["add_source_info"]:
-                        output_row.extend([
-                            file_path.name,
-                            sheet_name,
-                        ])
-
-                    output_row.append(batch_time)
-
-                    result_rows.append(output_row)
-
-            file_success += 1
-
-            try:
-                done_dir.mkdir(exist_ok=True)
-                dest = done_dir / file_path.name
-                if dest.exists():
-                    dest.unlink()
-                shutil.move(str(file_path), str(dest))
-                file_done_moved += 1
-                log(
-                    f"    -> 已移动到："
-                    f"{CONFIG['done_dir']}/"
-                    f"{file_path.name}"
-                )
-            except Exception as move_exc:
-                log(f"    [移动失败] {move_exc}")
-
-        else:
-
+        if not file_ok:
             file_failed += 1
+            continue
+        file_success += 1
+        for sr in sheet_results:
+            sheet_name = sr["sheet_name"]
+            for row in sr["rows"]:
+                raw_count += 1
+                primary_index = CONFIG["dedup_col"] - 1
+                fallback_index = CONFIG["fallback_dedup_col"] - 1
+                primary_key = normalize_key(row[primary_index])
+                fallback_key = normalize_key(row[fallback_index])
 
-            try:
-                error_dir.mkdir(exist_ok=True)
-                dest = error_dir / file_path.name
-                if dest.exists():
-                    dest.unlink()
-                shutil.move(str(file_path), str(dest))
-                file_moved += 1
-                log(
-                    f"    -> 已移动到："
-                    f"{CONFIG['error_dir']}/"
-                    f"{file_path.name}"
-                )
-            except Exception as move_exc:
-                log(f"    [移动失败] {move_exc}")
+                if primary_key:
+                    if primary_key in seen_primary_keys:
+                        duplicate_count += 1
+                        continue
+                    did_backfill = False
+                    if CONFIG["backfill_material_no_by_d"] and fallback_key:
+                        matched_rows = blank_primary_rows_by_d.get(fallback_key, [])
+                        if len(matched_rows) == 1:
+                            excel_row_no = matched_rows[0]
+                            backfill_updates[excel_row_no] = row[primary_index]
+                            backfill_count += 1
+                            did_backfill = True
+                            seen_primary_keys.add(primary_key)
+                            blank_primary_rows_by_d.pop(fallback_key, None)
+                            log(f"    [回填物料号] D={fallback_key} -> 汇总表第{excel_row_no}行 B={primary_key}")
+                        elif len(matched_rows) > 1:
+                            backfill_ambiguous_count += 1
+                            log(f"    [警告] D={fallback_key} 匹配到 {len(matched_rows)} 条B为空历史记录；本条按新行追加。")
+                    if did_backfill:
+                        continue
+                    seen_primary_keys.add(primary_key)
+                    if fallback_key:
+                        seen_fallback_keys.add(fallback_key)
+                else:
+                    if not fallback_key:
+                        continue
+                    if fallback_key in seen_fallback_keys:
+                        duplicate_count += 1
+                        continue
+                    seen_fallback_keys.add(fallback_key)
 
-    # --------------------------------------------------------
-    # 输出
-    # --------------------------------------------------------
+                output_row = list(row)
+                if CONFIG["add_source_info"]:
+                    output_row.extend([file_path.name, sheet_name])
+                output_row.append(batch_time)
+                result_rows.append(output_row)
 
-    header = build_header()
-
-    has_output_changes = bool(
-        result_rows or backfill_updates
-    )
-
-    if has_output_changes:
-
+    write_error = ""
+    if result_rows or backfill_updates:
         try:
-            # 只有“已有汇总表即将被修改”时才创建备份。
-            if (
-                CONFIG["backup_before_write"]
-                and output_path.exists()
-            ):
-                backup_path = backup_existing_output(
-                    output_path,
-                    Path(CONFIG["backup_dir"]),
-                )
+            if CONFIG["backup_before_write"] and output_path.exists():
+                backup_path = backup_existing_output(output_path, Path(CONFIG["backup_dir"]))
                 if backup_path is not None:
-                    log(
-                        f"[备份] 已创建：{backup_path}"
-                    )
-
-            append_output(
-                output_path,
-                result_rows,
-                header,
-                backfill_updates=backfill_updates,
-            )
-        except PermissionError:
-            log(
-                f"[错误] 输出文件被占用，"
-                f"请关闭 Excel 后重试：{output_path}"
-            )
+                    log(f"[备份] 已创建：{backup_path}")
+            append_output(output_path, result_rows, build_header(), backfill_updates=backfill_updates)
         except Exception as exc:
-            log(
-                f"[错误] 写入输出文件失败：{exc}"
-            )
-
-    # --------------------------------------------------------
-    # 结果
-    # --------------------------------------------------------
+            write_error = str(exc)
+            log(f"[错误] 写入主映射表失败：{exc}")
 
     log("\n" + "=" * 60)
-    log("处理完成")
-    log("=" * 60)
-
-    log(
-        f"Excel 文件总数：{len(excel_files)}"
-    )
-
-    log(
-        f"完全成功文件：{file_success}"
-    )
-
-    log(
-        f"存在异常文件：{file_failed}"
-    )
-
-    log(
-        f"已移动异常文件：{file_moved}"
-    )
-
-    log(
-        f"已移动已处理文件：{file_done_moved}"
-    )
-
-    log(
-        f"原始物料条数：{raw_count}"
-    )
-
-    log(
-        f"重复物料条数：{duplicate_count}"
-    )
-
-    log(
-        f"本次回填物料号：{backfill_count} 条"
-    )
-
-    log(
-        f"D列多重匹配未自动回填：{backfill_ambiguous_count} 条"
-    )
-
-    log(
-        f"本次新增物料条数：{len(result_rows)}"
-    )
-
-    log(
-        f"\n输出文件：{output_path}"
-    )
-
-    log(
-        f"日志文件：{log_path}"
-    )
-
+    log(f"成功文件：{file_success}，异常文件：{file_failed}")
+    log(f"原始物料：{raw_count}，重复：{duplicate_count}")
+    log(f"回填历史物料号：{backfill_count}")
+    log(f"本次新增物料：{len(result_rows)}")
+    log(f"日志：{log_path}")
     save_log(log_path)
 
+    if write_error:
+        return {"success": False, "can_continue": False, "new_materials": len(result_rows), "reason": f"写入主映射表失败：{write_error}"}
+    if file_failed:
+        return {"success": False, "can_continue": False, "new_materials": len(result_rows), "reason": f"有 {file_failed} 个文件读取失败，请查看项目日志。", "files": len(excel_files)}
 
-# ============================================================
-# 程序入口
-# ============================================================
+    new_count = len(result_rows)
+    return {
+        "success": True,
+        "can_continue": new_count == 0,
+        "new_materials": new_count,
+        "backfilled_material_nos": backfill_count,
+        "files": len(excel_files),
+        "reason": "" if new_count == 0 else f"发现 {new_count} 条新物料，请先完成映射配置。",
+        "log_file": str(log_path),
+    }
+
+
+def main() -> None:
+    import argparse
+    from project_utils import add_project_args, ensure_project_dir, write_result_json
+
+    parser = argparse.ArgumentParser(description="脚本1：导入客户物料清单")
+    add_project_args(parser)
+    args = parser.parse_args()
+    try:
+        result = run_project(ensure_project_dir(args.project))
+    except Exception as exc:
+        result = {"success": False, "can_continue": False, "new_materials": 0, "reason": str(exc)}
+        print(f"[错误] {exc}")
+    write_result_json(args.result_json, result)
+    raise SystemExit(0 if result.get("success") else 1)
+
 
 if __name__ == "__main__":
     main()

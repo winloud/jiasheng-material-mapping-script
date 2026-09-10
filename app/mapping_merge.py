@@ -47,9 +47,9 @@ CONFIG = {
 
     # 人工维护的映射区
     "mapping_start_col": "M",
-    "mapping_end_col": "V",
+    "mapping_end_col": "X",
 
-    # 覆盖时只允许覆盖人工映射区 M:V
+    # 覆盖时只允许覆盖人工映射区 M:X
     # 唯一例外：主表B为空、来源表B有值且D唯一匹配时，
     # 可以安全补写主表B列。
     "overwrite_mapping_only": True,
@@ -233,7 +233,7 @@ def copy_mapping_safely(
     source_row: int,
 ) -> Tuple[int, List[Tuple[int, Any, Any]]]:
     """
-    对 M:V 做“安全合并”：
+    对 M:X 做“安全合并”：
     - 相同：不动
     - 主表空、来源有值：自动补齐
     - 来源空、主表有值：保留主表，不清空
@@ -285,7 +285,7 @@ def overwrite_mapping(
 ) -> None:
     """
     用户明确选择“覆盖”时：
-    - 只覆盖 M:V；
+    - 只覆盖 M:X；
     - 若来源单元格为空，则默认不清空主表现有值；
     - 不覆盖 A:L 的基础字段。
     """
@@ -399,7 +399,7 @@ def show_conflict(
             for diff in diffs:
                 log("  " + diff)
         else:
-            log("  M:V 映射区没有差异；冲突来自匹配字段。")
+            log("  M:X 映射区没有差异；冲突来自匹配字段。")
 
     log("=" * 72)
 
@@ -440,7 +440,7 @@ def ask_action(
     while True:
         print(
             "\n请选择："
-            "\n  [O]  覆盖映射（仅M:V；不会用空值清空主表）"
+            "\n  [O]  覆盖映射（仅M:X；不会用空值清空主表）"
             "\n  [A]  新增为一行"
             "\n  [S]  跳过"
             "\n  [Q]  取消本次全部合并，不保存主表"
@@ -605,7 +605,7 @@ def main() -> None:
                         )
 
                         if mapping_conflicts:
-                            reason = "同一物料号的人工映射 M:V 存在冲突"
+                            reason = "同一物料号的人工映射 M:X 存在冲突"
                         else:
                             if auto_filled:
                                 any_change = True
@@ -687,7 +687,7 @@ def main() -> None:
                             candidate_rows = [master_row]
                             reason = (
                                 "按D唯一匹配到主表B为空行，已安全补B；"
-                                "但人工映射 M:V 存在冲突"
+                                "但人工映射 M:X 存在冲突"
                             )
                         else:
                             if auto_filled:
@@ -740,7 +740,7 @@ def main() -> None:
                     )
 
                     if mapping_conflicts:
-                        reason = "B为空，按D匹配后人工映射 M:V 存在冲突"
+                        reason = "B为空，按D匹配后人工映射 M:X 存在冲突"
                     else:
                         if auto_filled:
                             any_change = True
@@ -810,7 +810,7 @@ def main() -> None:
                     log("  [决定] 放弃覆盖，本条跳过")
                     continue
 
-                # 覆盖只改 M:V。
+                # 覆盖只改 M:X。
                 overwrite_mapping(
                     master_ws,
                     target_row,
@@ -834,7 +834,7 @@ def main() -> None:
                 stats["rows_overwritten"] += 1
                 log(
                     f"  [决定] 覆盖映射 -> 主表第{target_row}行 "
-                    f"(仅M:V，基础字段不覆盖)"
+                    f"(仅M:X，基础字段不覆盖)"
                 )
 
         source_wb.close()
