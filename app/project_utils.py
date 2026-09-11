@@ -43,6 +43,9 @@ def iter_project_excel_files(project_dir: Path) -> List[Path]:
             continue
         if name.startswith('01-') and '嘉盛-导入' in name:
             continue
+        # 报价单属于脚本3的辅助数据源，不是客户电气清单。
+        if '报价' in name:
+            continue
         result.append(p)
     return sorted(result)
 

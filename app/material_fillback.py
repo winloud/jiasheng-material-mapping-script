@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import re
 import shutil
 import tempfile
 import time
@@ -78,6 +79,25 @@ CONFIG = {
 
     # 主映射表中的公共物料 Sheet
     "common_material_sheet_name": "公共物料",
+}
+
+
+# ============================================================
+# 报价单驱动公共物料数量
+# ============================================================
+
+# 柜号示例：JSA26125-11~13、HZJF26071-26~29-47~50-55
+NUMBER_TOKEN_RE = re.compile(r"^(?P<start>\d+)(?:~(?P<end>\d+))?(?:\([^)]*\))?$")
+BASE_RE = re.compile(r"^[A-Za-z]+\d+$")
+
+# 特殊公共物料规则直接维护在 Python 中。
+# key = 公共物料 Sheet D 列型号；quote_model = 报价明细 C 列实际型号。
+QUOTE_COMMON_MATERIAL_RULES = {
+    "ZQV2.5N/50": {
+        "quote_model": "ZQV2.5N/10",
+        "quantity_divisor": Decimal("5"),
+        "round_after_division": True,
+    },
 }
 
 
@@ -337,71 +357,330 @@ def extract_mapping_pairs_from_values(
     return pairs, None
 
 
-def build_common_material_records(master_ws) -> List[Dict[str, Any]]:
-    """
-    从主映射表“公共物料”Sheet流式读取公共物料，并展开为标准汇总记录。
-    """
-    records: List[Dict[str, Any]] = []
+def build_common_material_definitions(master_ws) -> List[Dict[str, Any]]:
+    """读取“公共物料”配置。数量不在这里确定，脚本3按每张电气清单对应的报价柜型块动态取得。"""
+    definitions: List[Dict[str, Any]] = []
     max_col = MAPPING_MAX_COL
 
     for row_no, values in enumerate(
-        master_ws.iter_rows(
-            min_row=2,
-            max_col=max_col,
-            values_only=True,
-        ),
+        master_ws.iter_rows(min_row=2, max_col=max_col, values_only=True),
         start=2,
     ):
         name = values[2] if len(values) > 2 else None       # C
         model = values[3] if len(values) > 3 else None      # D
         brand = values[4] if len(values) > 4 else None      # E
         spec = values[5] if len(values) > 5 else None       # F
-
         pairs, mapping_error = extract_mapping_pairs_from_values(values)
 
         if is_empty(name) and is_empty(model) and not pairs and not mapping_error:
             continue
 
-        base = {
+        definitions.append({
             "来源Sheet": CONFIG["common_material_sheet_name"],
             "原始行号": row_no,
-            "客户物料号": None,
             "品名": name,
             "型号": model,
             "品牌": brand,
             "规格": spec,
+            "pairs": pairs,
+            "mapping_error": mapping_error,
+        })
+
+    return definitions
+
+
+def normalize_model(value: Any) -> str:
+    """报价型号匹配：忽略首尾空白，并将连续空白/换行折叠为一个空格。"""
+    if is_empty(value):
+        return ""
+    return " ".join(str(value).strip().split()).upper()
+
+
+def parse_cabinet_expression(value: Any) -> Tuple[str, List[str]]:
+    """
+    将“JSA26125-11~13”或电气清单文件名前缀展开为单柜集合。
+    遇到第一个非编号 token 即停止，因此后续“-电气清单...”不会干扰。
+    """
+    text = str(value or "").strip()
+    if not text:
+        return "", []
+    # 对文件名输入去掉扩展名；柜号单元格通常无扩展名，此操作同样安全。
+    stem = Path(text).stem.strip()
+    parts = stem.split("-")
+    if len(parts) < 2:
+        return "", []
+
+    base = parts[0].strip()
+    if not BASE_RE.fullmatch(base):
+        return "", []
+
+    codes: List[str] = []
+    for token in parts[1:]:
+        token = token.strip()
+        match = NUMBER_TOKEN_RE.fullmatch(token)
+        if not match:
+            break
+        start_text = match.group("start")
+        end_text = match.group("end")
+        if end_text is None:
+            codes.append(f"{base}-{start_text}")
+            continue
+        start_num = int(start_text)
+        end_num = int(end_text)
+        if end_num < start_num:
+            raise ValueError(f"反向柜号范围：{token}")
+        width = max(len(start_text), len(end_text))
+        for number in range(start_num, end_num + 1):
+            codes.append(f"{base}-{number:0{width}d}")
+    return base, codes
+
+
+def find_quote_file(project_dir: Path, project_base: str) -> Path:
+    """报价单位于项目根目录，文件名必须同时包含项目号和“报价”。"""
+    matches = []
+    base_upper = project_base.upper()
+    for path in project_dir.iterdir():
+        if not path.is_file() or path.name.startswith("~$"):
+            continue
+        if path.suffix.lower() not in {".xls", ".xlsx", ".xlsm"}:
+            continue
+        name_upper = path.name.upper()
+        if base_upper in name_upper and "报价" in path.name:
+            matches.append(path)
+
+    if len(matches) == 0:
+        raise RuntimeError(f"未找到报价单：文件名需同时包含 {project_base} 和“报价”。")
+    if len(matches) > 1:
+        raise RuntimeError(
+            f"找到多个 {project_base} 报价单，无法自动判断："
+            + " / ".join(p.name for p in matches)
+        )
+    return matches[0]
+
+
+def load_quote_blocks(path: Path, project_base: str) -> List[Dict[str, Any]]:
+    """读取报价单指定项目 Sheet，并解析所有“柜号:”明细块。"""
+    suffix = path.suffix.lower()
+    rows: List[Tuple[int, Any, Any, Any, Any]] = []  # row, A, B, C, F
+
+    if suffix in {".xlsx", ".xlsm"}:
+        wb = load_workbook(path, read_only=True, data_only=True)
+        try:
+            # 优先精确 Sheet 名；再允许大小写唯一匹配。
+            actual_sheet = project_base if project_base in wb.sheetnames else None
+            if actual_sheet is None:
+                candidates = [n for n in wb.sheetnames if n.upper() == project_base.upper()]
+                if len(candidates) == 1:
+                    actual_sheet = candidates[0]
+            if actual_sheet is None:
+                raise RuntimeError(f"报价单中找不到 Sheet：{project_base}")
+            ws = wb[actual_sheet]
+            for row_no, values in enumerate(
+                ws.iter_rows(min_row=1, max_col=6, values_only=True), start=1
+            ):
+                vals = list(values) + [None] * (6 - len(values))
+                rows.append((row_no, vals[0], vals[1], vals[2], vals[5]))
+        finally:
+            wb.close()
+    elif suffix == ".xls":
+        try:
+            import xlrd
+        except ImportError as exc:
+            raise RuntimeError("读取 .xls 报价单需要 xlrd。") from exc
+        wb = xlrd.open_workbook(str(path), on_demand=True)
+        try:
+            names = wb.sheet_names()
+            actual_sheet = project_base if project_base in names else None
+            if actual_sheet is None:
+                candidates = [n for n in names if n.upper() == project_base.upper()]
+                if len(candidates) == 1:
+                    actual_sheet = candidates[0]
+            if actual_sheet is None:
+                raise RuntimeError(f"报价单中找不到 Sheet：{project_base}")
+            ws = wb.sheet_by_name(actual_sheet)
+            for idx in range(ws.nrows):
+                def cv(col: int):
+                    return ws.cell_value(idx, col) if col < ws.ncols else None
+                rows.append((idx + 1, cv(0), cv(1), cv(2), cv(5)))
+        finally:
+            wb.release_resources()
+    else:
+        raise RuntimeError(f"不支持的报价单格式：{path.suffix}")
+
+    starts: List[Tuple[int, int, str, List[str]]] = []  # list_index, excel_row, raw_group, codes
+    for idx, (row_no, a, b, _c, _f) in enumerate(rows):
+        a_text = str(a or "").strip().replace("：", ":")
+        if not a_text.startswith("柜号"):
+            continue
+        raw_group = str(b or "").strip()
+        base, codes = parse_cabinet_expression(raw_group)
+        if base.upper() != project_base.upper() or not codes:
+            continue
+        starts.append((idx, row_no, raw_group, codes))
+
+    if not starts:
+        raise RuntimeError(f"报价单 Sheet {project_base} 中没有找到有效“柜号:”明细块。")
+
+    blocks: List[Dict[str, Any]] = []
+    for pos, (start_idx, start_row, raw_group, codes) in enumerate(starts):
+        end_idx = starts[pos + 1][0] if pos + 1 < len(starts) else len(rows)
+        model_rows: Dict[str, List[Tuple[int, Any, Any]]] = defaultdict(list)
+        for row_no, _a, _b, c, f in rows[start_idx + 1:end_idx]:
+            model_key = normalize_model(c)
+            if not model_key:
+                continue
+            model_rows[model_key].append((row_no, c, f))
+        blocks.append({
+            "start_row": start_row,
+            "group_text": raw_group,
+            "codes": [c.upper() for c in codes],
+            "models": dict(model_rows),
+        })
+    return blocks
+
+
+def resolve_quote_block(
+    source: Path,
+    project_dir: Path,
+    quote_cache: Dict[Tuple[str, str], Tuple[Path, List[Dict[str, Any]]]],
+) -> Tuple[Path, Dict[str, Any]]:
+    """按电气清单合并柜号集合，精确匹配报价单中的同一柜型块。"""
+    project_base, source_codes = parse_cabinet_expression(source.stem)
+    if not project_base or not source_codes:
+        raise RuntimeError(f"无法从电气清单文件名解析柜号范围：{source.name}")
+
+    cache_key = (str(project_dir.resolve()), project_base.upper())
+    cached = quote_cache.get(cache_key)
+    if cached is None:
+        quote_file = find_quote_file(project_dir, project_base)
+        blocks = load_quote_blocks(quote_file, project_base)
+        quote_cache[cache_key] = (quote_file, blocks)
+    else:
+        quote_file, blocks = cached
+
+    wanted = {c.upper() for c in source_codes}
+    matches = [b for b in blocks if set(b["codes"]) == wanted]
+    if len(matches) == 0:
+        raise RuntimeError(
+            f"报价单 {quote_file.name} / Sheet {project_base} 中找不到与电气清单完全对应的柜号块："
+            f"{', '.join(source_codes)}"
+        )
+    if len(matches) > 1:
+        raise RuntimeError(
+            f"报价单中柜号集合重复出现 {len(matches)} 次，无法唯一定位：{', '.join(source_codes)}"
+        )
+    return quote_file, matches[0]
+
+
+def apply_quote_quantity_rule(common_model: Any, quote_qty: Decimal) -> Decimal:
+    """公共物料特殊换算。明确使用 Python 内置 round()，不是 roundup。"""
+    key = normalize_model(common_model)
+    rule = QUOTE_COMMON_MATERIAL_RULES.get(key)
+    if not rule:
+        return quote_qty
+
+    divisor = rule.get("quantity_divisor")
+    if divisor:
+        quote_qty = quote_qty / divisor
+    if rule.get("round_after_division"):
+        quote_qty = Decimal(round(quote_qty))
+    return quote_qty
+
+
+def quote_lookup_model(common_model: Any) -> str:
+    key = normalize_model(common_model)
+    rule = QUOTE_COMMON_MATERIAL_RULES.get(key)
+    if rule:
+        return str(rule.get("quote_model") or common_model)
+    return str(common_model or "")
+
+
+def build_common_records_from_quote(
+    definitions: List[Dict[str, Any]],
+    quote_block: Dict[str, Any],
+) -> Tuple[List[Dict[str, Any]], int]:
+    """按当前“合并柜型”报价块，为公共物料计算单台柜 BOM 数量。"""
+    records: List[Dict[str, Any]] = []
+    abnormal = 0
+    models = quote_block["models"]
+
+    for definition in definitions:
+        base = {
+            "来源Sheet": CONFIG["common_material_sheet_name"],
+            "原始行号": definition["原始行号"],
+            "客户物料号": None,
+            "品名": definition.get("品名"),
+            "型号": definition.get("型号"),
+            "品牌": definition.get("品牌"),
+            "规格": definition.get("规格"),
             "客户数量": None,
             "物料来源": "公共物料",
         }
+        mapping_error = definition.get("mapping_error")
+        pairs = definition.get("pairs") or []
 
         if mapping_error:
-            records.append({
-                **base,
-                "京能物料号": None,
-                "京能数量": None,
-                "匹配状态": mapping_error,
-            })
+            records.append({**base, "京能物料号": None, "京能数量": None,
+                            "匹配状态": mapping_error})
+            abnormal += 1
             continue
-
         if not pairs:
-            records.append({
-                **base,
-                "京能物料号": None,
-                "京能数量": None,
-                "匹配状态": "未配置京能物料",
-            })
+            records.append({**base, "京能物料号": None, "京能数量": None,
+                            "匹配状态": "未配置京能物料"})
+            abnormal += 1
             continue
 
-        for material, qty in pairs:
+        common_model = definition.get("型号")
+        lookup_model = quote_lookup_model(common_model)
+        lookup_key = normalize_model(lookup_model)
+        if not lookup_key:
+            records.append({**base, "京能物料号": None, "京能数量": None,
+                            "匹配状态": "公共物料型号为空，无法匹配报价"})
+            abnormal += 1
+            continue
+
+        hits = models.get(lookup_key, [])
+        if len(hits) == 0:
+            records.append({**base, "京能物料号": None, "京能数量": None,
+                            "匹配状态": f"报价未找到型号：{lookup_model}"})
+            abnormal += 1
+            continue
+        if len(hits) > 1:
+            rows = ",".join(str(hit[0]) for hit in hits)
+            records.append({**base, "京能物料号": None, "京能数量": None,
+                            "匹配状态": f"报价型号重复：{lookup_model}（行{rows}）"})
+            abnormal += 1
+            continue
+
+        quote_row, _raw_model, raw_qty = hits[0]
+        try:
+            quote_qty = to_decimal(raw_qty)
+        except ValueError:
+            quote_qty = None
+        if quote_qty is None:
+            records.append({**base, "京能物料号": None, "京能数量": None,
+                            "匹配状态": f"报价数量异常：{lookup_model} / F{quote_row}={raw_qty}"})
+            abnormal += 1
+            continue
+
+        try:
+            effective_qty = apply_quote_quantity_rule(common_model, quote_qty)
+        except Exception as exc:
+            records.append({**base, "京能物料号": None, "京能数量": None,
+                            "匹配状态": f"报价数量换算失败：{lookup_model} / {exc}"})
+            abnormal += 1
+            continue
+
+        for material, factor in pairs:
+            final_qty = effective_qty * factor
             records.append({
                 **base,
                 "京能物料号": material,
-                "京能数量": decimal_to_excel(qty),
+                "京能数量": decimal_to_excel(final_qty),
                 "匹配状态": "已匹配",
             })
 
-    return records
-
+    return records, abnormal
 
 def create_summary_sheet(wb, records: List[Dict[str, Any]]) -> None:
     """重建“京能物料对应汇总”，作为第4个及后续脚本的统一数据接口。"""
@@ -446,6 +725,13 @@ def create_summary_sheet(wb, records: List[Dict[str, Any]]) -> None:
     }
     for col, width in widths.items():
         ws.column_dimensions[col].width = width
+
+    # 输出文件用 Excel 打开时，默认显示“京能物料对应汇总”。
+    # 仅改变工作簿的活动 Sheet，不影响其它 Sheet 的内容和处理逻辑。
+    for sheet in wb.worksheets:
+        sheet.sheet_view.tabSelected = False
+    ws.sheet_view.tabSelected = True
+    wb.active = ws
 
 
 # ============================================================
@@ -537,7 +823,7 @@ def build_master_indexes(master_path: Path):
         common_records: List[Dict[str, Any]] = []
         common_sheet_name = CONFIG["common_material_sheet_name"]
         if common_sheet_name in wb.sheetnames:
-            common_records = build_common_material_records(wb[common_sheet_name])
+            common_records = build_common_material_definitions(wb[common_sheet_name])
 
         return dict(b_index), dict(d_index), mappings, common_records
     finally:
@@ -798,15 +1084,32 @@ def build_output_name(source: Path) -> str:
 
 def process_one_file(
     source: Path,
+    project_dir: Path,
     b_index: Dict[str, List[int]],
     d_index: Dict[str, List[int]],
     mappings: Dict[int, Tuple[List[Tuple[Any, Decimal]], Optional[str]]],
-    common_records: List[Dict[str, Any]],
+    common_definitions: List[Dict[str, Any]],
+    quote_cache: Dict[Tuple[str, str], Tuple[Path, List[Dict[str, Any]]]],
     xls_converter: Optional[ExcelXlsConverter] = None,
-) -> Tuple[Path, Dict[str, Dict[str, int]]]:
+) -> Tuple[Path, Dict[str, Dict[str, int]], Dict[str, Any]]:
     suffix = source.suffix.lower()
     if suffix not in (".xls", ".xlsx", ".xlsm"):
         raise ValueError(f"不支持的文件类型：{suffix}")
+
+    quote_info: Dict[str, Any] = {"records": 0, "abnormal": 0}
+    common_records: List[Dict[str, Any]] = []
+    if common_definitions:
+        quote_file, quote_block = resolve_quote_block(source, project_dir, quote_cache)
+        common_records, common_abnormal = build_common_records_from_quote(
+            common_definitions, quote_block
+        )
+        quote_info = {
+            "quote_file": str(quote_file),
+            "quote_group": quote_block["group_text"],
+            "quote_row": quote_block["start_row"],
+            "records": len(common_records),
+            "abnormal": common_abnormal,
+        }
 
     temp_ctx = tempfile.TemporaryDirectory(prefix="material_fillback_")
     try:
@@ -854,7 +1157,7 @@ def process_one_file(
 
             output_path = unique_path(OUTPUT_DIR, build_output_name(source))
             wb.save(output_path)
-            return output_path, file_stats
+            return output_path, file_stats, quote_info
         finally:
             wb.close()
     finally:
@@ -898,7 +1201,7 @@ def run_project(project_dir: Path) -> Dict[str, Any]:
     log(f"发现客户清单：{len(files)} 个")
     log("正在读取主映射汇总表...")
     try:
-        b_index, d_index, mappings, common_records = build_master_indexes(MASTER_FILE)
+        b_index, d_index, mappings, common_definitions = build_master_indexes(MASTER_FILE)
     except Exception as exc:
         result = {"success": False, "can_continue": False, "abnormal_rows": 0,
                   "reason": f"无法读取主映射汇总表：{exc}"}
@@ -906,12 +1209,13 @@ def run_project(project_dir: Path) -> Dict[str, Any]:
         save_log()
         return result
 
-    common_abnormal = sum(1 for r in common_records if str(r.get("匹配状态") or "") != "已匹配")
-    log(f"公共物料展开记录：{len(common_records)} 条，异常：{common_abnormal} 条\n")
+    log(f"公共物料配置：{len(common_definitions)} 条；数量将在每张电气清单对应的报价柜型块中提取。\n")
     ok_count = fail_count = 0
     total_source_rows = total_matched_rows = total_expanded_rows = 0
-    total_abnormal_rows = common_abnormal
+    total_abnormal_rows = 0
+    total_common_records = total_common_abnormal = 0
     output_files: List[str] = []
+    quote_cache: Dict[Tuple[str, str], Tuple[Path, List[Dict[str, Any]]]] = {}
 
     has_xls = any(path.suffix.lower() == ".xls" for path in files)
     converter_ctx = ExcelXlsConverter() if has_xls else None
@@ -940,10 +1244,23 @@ def run_project(project_dir: Path) -> Dict[str, Any]:
             file_started = time.perf_counter()
             log(f"[{index}/{len(files)}] {source.relative_to(project_dir)}")
             try:
-                output_path, file_stats = process_one_file(
-                    source, b_index, d_index, mappings, common_records, converter
+                output_path, file_stats, quote_info = process_one_file(
+                    source, project_dir, b_index, d_index, mappings,
+                    common_definitions, quote_cache, converter
                 )
                 output_files.append(str(output_path))
+                if quote_info.get("quote_file"):
+                    log(
+                        f"    报价：{Path(quote_info['quote_file']).name} / "
+                        f"柜号 {quote_info.get('quote_group')} / 起始行 {quote_info.get('quote_row')}"
+                    )
+                    log(
+                        f"    公共物料：展开{quote_info.get('records', 0)}条，"
+                        f"异常{quote_info.get('abnormal', 0)}条"
+                    )
+                    total_common_records += int(quote_info.get("records", 0))
+                    total_common_abnormal += int(quote_info.get("abnormal", 0))
+                    total_abnormal_rows += int(quote_info.get("abnormal", 0))
                 for sheet_name, stats in file_stats.items():
                     abnormal = (stats["unmatched_rows"] + stats["conflict_rows"] +
                                 stats["quantity_error_rows"] + stats["mapping_error_rows"] +
@@ -970,7 +1287,9 @@ def run_project(project_dir: Path) -> Dict[str, Any]:
     log(f"客户原始物料行：{total_source_rows}")
     log(f"成功匹配客户行：{total_matched_rows}")
     log(f"1:N 展开新增行：{total_expanded_rows}")
-    log(f"异常客户行：{total_abnormal_rows}")
+    log(f"公共物料输出记录：{total_common_records}")
+    log(f"公共物料异常：{total_common_abnormal}")
+    log(f"总异常记录：{total_abnormal_rows}")
     log(f"脚本3总耗时：{total_elapsed:.2f}s")
     log(f"日志：{LOG_FILE}")
     save_log()

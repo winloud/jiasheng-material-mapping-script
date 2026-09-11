@@ -107,7 +107,7 @@ def main() -> None:
     while True:
         clear_screen()
         print("=" * 64)
-        print("                 嘉盛物料映射工具 v1.4.2")
+        print("                 嘉盛物料映射工具 v1.5.0")
         print("=" * 64)
         print()
         print("  1 - 导入客户物料清单（选择项目文件夹）")
